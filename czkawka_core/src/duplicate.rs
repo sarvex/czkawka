@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use std::hash::Hasher;
 use std::io::{BufReader, BufWriter};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::sleep;
 
@@ -340,12 +341,76 @@ impl DuplicateFinder {
         //// PROGRESS THREAD END
 
         let sst: SystemTime = SystemTime::now();
-        let (tx, rx) = std::sync::mpsc::channel();
+
+        let allowed_extensions = Arc::new(self.allowed_extensions.file_extensions.clone());
+        let minimal_file_size = self.minimal_file_size.clone();
+        let maximal_file_size = self.maximal_file_size.clone();
+
+        let (tx, rx): (std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<PathBuf>) = std::sync::mpsc::channel();
         let collect_thread = std::thread::spawn(move || {
-            let mut vec = Vec::new();
-            for path in rx {
-                vec.push(path);
+            let mut vec: Vec<(String, FileEntry)> = Vec::new();
+            for path_buf in rx {
+                if path_buf.is_dir() {
+                    continue;
+                }
+                let file_name_lowercase = match path_buf.file_name() {
+                    Some(t) => t.to_string_lossy().to_lowercase(),
+                    None => continue,
+                };
+
+                // Checking allowed extensions
+                if !allowed_extensions.is_empty() {
+                    let allowed = allowed_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
+                    if !allowed {
+                        // Not an allowed extension, ignore it.
+                        continue;
+                    }
+                }
+
+                let metadata = match fs::metadata(&path_buf) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                // Checking files
+                if (minimal_file_size..=maximal_file_size).contains(&metadata.len()) {
+                    let current_file_path = match path_buf.canonicalize() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let file_name = match path_buf.file_name() {
+                        Some(t) => t.to_string_lossy().to_string(),
+                        None => continue,
+                    };
+                    // TODO Check if this is needed
+                    // if self.excluded_items.is_excluded(&current_file_name) {
+                    //     return;
+                    // }
+
+                    // Creating new file entrymatch
+                    let fe: FileEntry = FileEntry {
+                        path: current_file_path,
+                        size: metadata.len(),
+                        modified_date: match metadata.modified() {
+                            Ok(t) => match t.duration_since(UNIX_EPOCH) {
+                                Ok(d) => d.as_secs(),
+                                Err(_) => {
+                                    // self.text_messages.warnings.push(format!("File {} seems to be modified before Unix Epoch.", current_file_path.display()));
+                                    0
+                                }
+                            },
+                            Err(_) => {
+                                // self.text_messages.warnings.push(format!("Unable to get modification date from file {}", current_file_path.display()));
+                                continue;
+                            } // Permissions Denied
+                        },
+                        hash: "".to_string(),
+                    };
+
+                    vec.push((file_name, fe));
+                }
             }
+
             vec
         });
 
@@ -405,81 +470,11 @@ impl DuplicateFinder {
         }
 
         drop(tx);
-        let files_to_check = collect_thread.join().unwrap();
-        println!("Number of searched files: {}", files_to_check.len());
+        let files_checked = collect_thread.join().unwrap();
+        println!("Number of searched files: {}", files_checked.len());
         // TODO Par iter needed
 
-        let allowed_extensions = Arc::new(self.allowed_extensions.file_extensions.clone());
-
-        let results = files_to_check
-            .par_iter()
-            .map(|path_buf| {
-                if path_buf.is_dir() {
-                    return None;
-                }
-                let file_name_lowercase = match path_buf.file_name() {
-                    Some(t) => t.to_string_lossy().to_lowercase(),
-                    None => return None,
-                };
-
-                // Checking allowed extensions
-                if !allowed_extensions.is_empty() {
-                    let allowed = allowed_extensions.iter().any(|e| file_name_lowercase.ends_with((".".to_string() + e.to_lowercase().as_str()).as_str()));
-                    if !allowed {
-                        // Not an allowed extension, ignore it.
-                        return None;
-                    }
-                }
-
-                let metadata = match fs::metadata(&path_buf) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-
-                // Checking files
-                if (self.minimal_file_size..=self.maximal_file_size).contains(&metadata.len()) {
-                    let current_file_path = match path_buf.canonicalize() {
-                        Ok(t) => t,
-                        Err(_) => return None,
-                    };
-                    let file_name = match path_buf.file_name() {
-                        Some(t) => t.to_string_lossy().to_string(),
-                        None => return None,
-                    };
-                    // TODO Check if this is needed
-                    // if self.excluded_items.is_excluded(&current_file_name) {
-                    //     return;
-                    // }
-
-                    // Creating new file entrymatch
-                    let fe: FileEntry = FileEntry {
-                        path: current_file_path,
-                        size: metadata.len(),
-                        modified_date: match metadata.modified() {
-                            Ok(t) => match t.duration_since(UNIX_EPOCH) {
-                                Ok(d) => d.as_secs(),
-                                Err(_) => {
-                                    // self.text_messages.warnings.push(format!("File {} seems to be modified before Unix Epoch.", current_file_path.display()));
-                                    0
-                                }
-                            },
-                            Err(_) => {
-                                // self.text_messages.warnings.push(format!("Unable to get modification date from file {}", current_file_path.display()));
-                                return None;
-                            } // Permissions Denied
-                        },
-                        hash: "".to_string(),
-                    };
-
-                    return Some((file_name, fe));
-                }
-                None
-            })
-            .filter(|a| a.is_some())
-            .map(|a| a.unwrap())
-            .collect::<Vec<(String, FileEntry)>>();
-
-        for entry in results {
+        for entry in files_checked {
             // Adding files to BTreeMap
             self.files_with_identical_names.entry(entry.0.clone()).or_insert_with(Vec::new);
             self.files_with_identical_names.get_mut(&entry.0).unwrap().push(entry.1);
